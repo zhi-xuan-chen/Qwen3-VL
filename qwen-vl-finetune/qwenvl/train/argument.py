@@ -9,6 +9,9 @@ class ModelArguments:
     tune_mm_llm: bool = field(default=False)
     tune_mm_mlp: bool = field(default=False)
     tune_mm_vision: bool = field(default=False)
+    # 自定义视觉 encoder：指定后替换 model.visual 为 qwenvl.vision 中的实现
+    custom_vision_encoder: Optional[str] = field(default=None, metadata={"help": "e.g. rad_dino, gloria, chexzero"})
+    custom_vision_pretrained_path: Optional[str] = field(default=None, metadata={"help": "pretrained checkpoint for rad_dino/our_ark_*"})
 
 @dataclass
 class DataArguments:

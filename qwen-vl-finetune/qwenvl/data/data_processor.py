@@ -1,4 +1,5 @@
 import json
+import math
 import random
 import logging
 import re
@@ -12,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+from PIL import Image
 
 import transformers
 
@@ -241,11 +243,126 @@ def preprocess_qwen_visual(
     return full_result
 
 
+def preprocess_qwen_visual_custom(
+    sources,
+    processor,
+    custom_vision_config,
+) -> Dict:
+    """自定义视觉 encoder 的图片处理：完全绕过 Qwen 的 image processor。
+    
+    图片由 get_custom_image_transform 生成的 transform 处理。
+    文本由 tokenizer.apply_chat_template 格式化，手动插入正确数量的 image_pad token。
+    """
+    if len(sources) != 1:
+        raise ValueError(f"Expected 1 source, got {len(sources)}")
+
+    source = sources[0]
+    base_path = Path(source.get("data_path", ""))
+
+    num_tokens = custom_vision_config["num_tokens"]
+    transform = custom_vision_config["transform"]
+    merge_size = custom_vision_config.get("merge_size", 2)
+
+    # ---- 1. 解析 conversations，收集图片路径 ----
+    conversations = source["conversations"]
+    images = source.get("image") or []
+    if isinstance(images, str):
+        images = [images]
+    image_paths = [str((base_path / img).resolve()) for img in images]
+
+    # ---- 2. 构建 vision block ----
+    # <|vision_start|> + N 个 <|image_pad|> + <|vision_end|>
+    vision_block = (
+        "<|vision_start|>"
+        + "<|image_pad|>" * num_tokens
+        + "<|vision_end|>"
+    )
+
+    # ---- 3. 构建 messages，<image> 替换为 vision block ----
+    simple_messages = []
+    for turn in conversations:
+        role = "user" if turn["from"] == "human" else "assistant"
+        text = turn["value"]
+        if role == "user":
+            parts = re.split(r"(<image>)", text)
+            content = ""
+            for part in parts:
+                if part == "<image>":
+                    content += vision_block
+                else:
+                    content += part
+            simple_messages.append({"role": role, "content": content})
+        else:
+            simple_messages.append({"role": role, "content": text})
+
+    # ---- 4. 用 tokenizer 的 chat template 格式化并 tokenize ----
+    tokenizer = processor.tokenizer
+    input_ids = tokenizer.apply_chat_template(
+        simple_messages,
+        tokenize=True,
+        return_tensors="pt",
+        add_generation_prompt=False,
+    )
+    if isinstance(input_ids, list):
+        input_ids = torch.tensor(input_ids).unsqueeze(0)
+    if input_ids.dim() == 1:
+        input_ids = input_ids.unsqueeze(0)
+
+    # ---- 5. 构建 labels（与 preprocess_qwen_visual 相同逻辑） ----
+    labels = torch.full_like(input_ids, IGNORE_INDEX)
+    input_ids_flat = input_ids[0].tolist()
+    L = len(input_ids_flat)
+    pos = 0
+    while pos < L:
+        if input_ids_flat[pos] == 77091:
+            ans_start = pos + 2
+            ans_end = ans_start
+            while ans_end < L and input_ids_flat[ans_end] != 151645:
+                ans_end += 1
+            if ans_end < L:
+                labels[0, ans_start : ans_end + 2] = input_ids[
+                    0, ans_start : ans_end + 2
+                ]
+                pos = ans_end
+        pos += 1
+
+    result = {
+        "input_ids": input_ids,
+        "labels": labels,
+    }
+
+    # ---- 6. 加载 PIL 图片并应用自定义 transform ----
+    if image_paths:
+        pil_images = [Image.open(p).convert("RGB") for p in image_paths]
+        pixel_values = torch.stack([transform(img) for img in pil_images])
+
+        # image_grid_thw: 自定义 encoder 无 merge，要求 num_tokens 为完全平方数，取 llm_h = llm_w = sqrt(num_tokens)
+        s = int(math.isqrt(num_tokens))
+        if s * s != num_tokens:
+            raise ValueError(
+                f"custom_vision_encoder 要求 num_tokens 为完全平方数，当前 num_tokens={num_tokens}。"
+                f" 请检查 VIS_ENCODER_CONFIG 中该 encoder 的 num_tokens（应为 patch 数的平方，如 49、1369）。"
+            )
+        llm_h = llm_w = s
+        grid_h = llm_h * merge_size
+        grid_w = llm_w * merge_size
+        image_grid_thw = torch.tensor(
+            [[1, grid_h, grid_w]] * len(image_paths), dtype=torch.long
+        )
+
+        result["pixel_values"] = pixel_values
+        result["image_grid_thw"] = image_grid_thw
+
+    return result
+
+
 class LazySupervisedDataset(Dataset):
     """Dataset for supervised fine-tuning."""
 
     def __init__(self, processor, data_args):
         super(LazySupervisedDataset, self).__init__()
+        # 尽早初始化，确保 pickle 到 worker 进程时该属性存在
+        self.custom_vision_config = None
 
         dataset = data_args.dataset_use.split(",")
         dataset_list = data_list(dataset)
@@ -292,9 +409,30 @@ class LazySupervisedDataset(Dataset):
 
         rank0_print(f"Total training samples: {len(list_data_dict)}")
 
-
         rank0_print("Formatting inputs...Skip in lazy mode")
-        processor = update_processor_pixels(processor, data_args)
+
+        # 自定义视觉 encoder 配置（custom_vision_config 已在 __init__ 开头初始化为 None）
+        custom_encoder_name = getattr(data_args, "custom_vision_encoder", None)
+        if custom_encoder_name:
+            from qwenvl.vision.transforms import get_custom_image_transform
+            from qwenvl.vision.utils import VIS_ENCODER_CONFIG
+
+            cfg = VIS_ENCODER_CONFIG[custom_encoder_name]
+            merge_size = getattr(processor.image_processor, "merge_size", 2)
+            self.custom_vision_config = {
+                "model_name": custom_encoder_name,
+                "num_tokens": cfg["num_tokens"],
+                "transform": get_custom_image_transform(custom_encoder_name),
+                "merge_size": merge_size,
+            }
+            rank0_print(
+                f"Custom vision encoder: {custom_encoder_name}, "
+                f"num_tokens={cfg['num_tokens']}, merge_size={merge_size}"
+            )
+            rank0_print("Skipping Qwen image processor pixel update (using custom transforms)")
+        else:
+            processor = update_processor_pixels(processor, data_args)
+
         self.processor = processor
         self.tokenizer = processor.tokenizer
         self.data_args = data_args
@@ -387,10 +525,18 @@ class LazySupervisedDataset(Dataset):
             raise e
 
     def _get_item(self, sources) -> Dict[str, torch.Tensor]:
-        data_dict = preprocess_qwen_visual(
-            sources,
-            self.processor,
-        )
+        custom_vision_config = getattr(self, "custom_vision_config", None)
+        if custom_vision_config:
+            data_dict = preprocess_qwen_visual_custom(
+                sources,
+                self.processor,
+                custom_vision_config,
+            )
+        else:
+            data_dict = preprocess_qwen_visual(
+                sources,
+                self.processor,
+            )
 
         seq_len = data_dict["input_ids"][0].size(0)
 

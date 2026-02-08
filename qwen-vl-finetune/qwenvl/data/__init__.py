@@ -26,12 +26,30 @@ VIDEOCHATGPT = {
     "data_path": "PATH_TO_VIDEOCHATGPT_DATA",
 }
 
+MIMIC_TRAIN = {
+    "annotation_path": "/jhcnas4/XR/MIMIC-CXR/labels/qwen/mimic_qwen_train.json",
+    "data_path": "/jhcnas4/XR/MIMIC-CXR/imgs-1024",
+}
+
+MIMIC_VALID = {
+    "annotation_path": "/jhcnas4/XR/MIMIC-CXR/labels/qwen/mimic_qwen_valid.json",
+    "data_path": "/jhcnas4/XR/MIMIC-CXR/imgs-1024",
+}
+
+MIMIC_TEST = {
+    "annotation_path": "/jhcnas4/XR/MIMIC-CXR/labels/qwen/mimic_qwen_test.json",
+    "data_path": "/jhcnas4/XR/MIMIC-CXR/imgs-1024",
+}
+
 data_dict = {
     "cambrian_737k": CAMBRIAN_737K,
     "cambrian_737k_pack": CAMBRIAN_737K_PACK,
     "mp_doc": MP_DOC,
     "clevr_mc": CLEVR_MC,
     "videochatgpt": VIDEOCHATGPT,
+    "mimic_train": MIMIC_TRAIN,
+    "mimic_valid": MIMIC_VALID,
+    "mimic_test": MIMIC_TEST,
 }
 
 

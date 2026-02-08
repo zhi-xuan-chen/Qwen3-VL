@@ -134,6 +134,65 @@ def train(attn_implementation="flash_attention_2"):
         data_args.model_type = "qwen2vl"
 
     print(f'the initlized model is {model_args.model_name_or_path} the class is {model.__class__.__name__}')
+
+    # 可选：替换为自定义视觉 encoder
+    if model_args.custom_vision_encoder:
+        import types
+        from qwenvl.vision import build_custom_vision_for_qwen
+
+        llm_hidden_size = getattr(
+            model.config, "hidden_size",
+            getattr(model.config.text_config, "hidden_size", 3584),
+        )
+        encoder_cfg = {"model_name": model_args.custom_vision_encoder}
+        if model_args.custom_vision_pretrained_path:
+            encoder_cfg["pretrained_path"] = model_args.custom_vision_pretrained_path
+
+        # 获取 processor 的 merge_size，使 wrapper.spatial_merge_size 与数据管道一致
+        _merge_size = getattr(
+            AutoProcessor.from_pretrained(model_args.model_name_or_path).image_processor,
+            "merge_size", 2,
+        )
+
+        custom_visual = build_custom_vision_for_qwen(
+            encoder_cfg=encoder_cfg,
+            llm_hidden_size=llm_hidden_size,
+            spatial_merge_size=_merge_size,
+        )
+        custom_visual = custom_visual.to(
+            dtype=torch.bfloat16 if training_args.bf16 else torch.float32,
+            device=model.device,
+        )
+        model.model.visual = custom_visual
+        # 关闭 DeepStack（自定义 encoder 无多层 ViT 输出）
+        if hasattr(model.model, "visual") and hasattr(model.model.visual, "deepstack_visual_indexes"):
+            model.model.visual.deepstack_visual_indexes = []
+
+        # Monkey-patch get_image_features：避免在 DeepSpeed ZeRO-3 下
+        # tuple unpacking 与自定义 visual 返回值不兼容的问题
+        _orig_model = model.model  # Qwen3VLModel 实例
+
+        def _custom_get_image_features(self, pixel_values, image_grid_thw=None):
+            pixel_values = pixel_values.type(self.visual.dtype)
+            result = self.visual(pixel_values, grid_thw=image_grid_thw)
+            # 兼容 tuple / list / 其他可迭代返回
+            if isinstance(result, (tuple, list)):
+                image_embeds = result[0]
+                deepstack_image_embeds = result[1] if len(result) > 1 else []
+            else:
+                image_embeds = result
+                deepstack_image_embeds = []
+            split_sizes = (image_grid_thw.prod(-1) // self.visual.spatial_merge_size ** 2).tolist()
+            image_embeds = torch.split(image_embeds, split_sizes)
+            return image_embeds, deepstack_image_embeds
+
+        _orig_model.get_image_features = types.MethodType(_custom_get_image_features, _orig_model)
+
+        rank0_print(f"Replaced model.visual with custom encoder: {model_args.custom_vision_encoder}")
+        rank0_print(f"  spatial_merge_size={_merge_size}")
+        # 同步到 data_args，使数据管道使用自定义 transform 而非 Qwen image processor
+        data_args.custom_vision_encoder = model_args.custom_vision_encoder
+
     processor = AutoProcessor.from_pretrained(
         model_args.model_name_or_path,
     )
@@ -176,11 +235,26 @@ def train(attn_implementation="flash_attention_2"):
             task_type=TaskType.CAUSAL_LM,
         )
         model = get_peft_model(model, lora_config)
+
+        # LoRA 模式下，tune_mm_mlp 仍需生效：解冻 merger，医学影像等域适应需要投影层适配
+        if model_args.tune_mm_mlp:
+            base = getattr(model, "base_model", model) or model
+            inner = getattr(base, "model", base)
+            visual = getattr(inner, "visual", None) or getattr(base, "visual", None) or getattr(model, "visual", None)
+            if visual is not None and hasattr(visual, "merger"):
+                for p in visual.merger.parameters():
+                    p.requires_grad = True
+                rank0_print("LoRA mode: merger (tune_mm_mlp) set to trainable")
+
+        if torch.distributed.get_rank() == 0:
+            model.print_trainable_parameters()
     else:
         set_model(model_args, model)
 
         if torch.distributed.get_rank() == 0:
-            model.visual.print_trainable_parameters()
+            visual = getattr(model, "visual", model.model.visual)
+            if hasattr(visual, "print_trainable_parameters"):
+                visual.print_trainable_parameters()
             model.model.print_trainable_parameters()
     
     data_module = make_supervised_data_module(processor, data_args=data_args)
