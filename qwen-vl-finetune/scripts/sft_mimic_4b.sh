@@ -34,7 +34,7 @@ datasets=mimic_train
 
 # Output configuration
 run_name="qwen3vl-mimic-4b"
-output_dir=/jhcnas5/chenzhixuan/checkpoints/XRay-VLP/experiments/RG/mimic/qwen
+output_dir=/jhcnas5/chenzhixuan/checkpoints/XRay-VLP/experiments/RG/mimic/qwen4b
 
 # Training arguments
 args="

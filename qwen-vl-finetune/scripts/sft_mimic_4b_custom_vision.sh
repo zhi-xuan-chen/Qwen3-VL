@@ -7,8 +7,8 @@ export CUDA_VISIBLE_DEVICES=0
 NPROC_PER_NODE=1
 
 # Weights & Biases
-export WANDB_PROJECT="mimic-cxr"
-export WANDB_ENTITY=""
+export WANDB_PROJECT="qwen3-vl-xr"
+export WANDB_ENTITY="zchenhi"  # 可选，填你的 wandb 用户名或 team 名
 
 # Distributed training configuration
 MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
@@ -33,7 +33,7 @@ fi
 
 # Training hyperparameters
 lr=1e-6
-batch_size=1
+batch_size=4
 grad_accum_steps=4
 
 # Training entry point
@@ -52,7 +52,7 @@ fi
 
 # Output configuration：run_name 与 output_dir 末尾均含 qwen + 上述 model name
 run_name="qwen3vl-mimic-4b-${CUSTOM_VISION_MODEL_NAME}"
-output_dir=/jhcnas5/chenzhixuan/checkpoints/XRay-VLP/experiments/RG/mimic/qwen_${CUSTOM_VISION_MODEL_NAME}
+output_dir=/jhcnas5/chenzhixuan/checkpoints/XRay-VLP/experiments/RG/mimic/qwen4b_${CUSTOM_VISION_MODEL_NAME}
 
 # Training arguments：仅 our_ 开头且路径非空时传预训练权重
 extra_custom=""
@@ -96,7 +96,7 @@ args="
     --gradient_checkpointing True \
     --dataloader_num_workers 4 \
     --run_name ${run_name} \
-    --report_to none"
+    --report_to wandb"
 
 # Launch training
 cd "$(dirname "${BASH_SOURCE[0]}")/.."

@@ -52,6 +52,7 @@ def row_to_qwen_item(
     image_base_path: str,
     prompt: str,
     use_relative_path: bool = False,
+    id_column: Optional[str] = None,
 ) -> Optional[dict]:
     """
     将 CSV 一行转换为 Qwen JSON 单条。
@@ -85,13 +86,18 @@ def row_to_qwen_item(
 
     human_value = build_human_value(len(paths), prompt)
 
-    return {
+    out = {
         "image": image_field,
         "conversations": [
             {"from": "human", "value": human_value},
             {"from": "gpt", "value": findings},
         ],
     }
+    if id_column and id_column in row:
+        val = row[id_column]
+        if val is not None and str(val) != "nan":
+            out["id"] = val if isinstance(val, (int, str)) else str(val)
+    return out
 
 
 def main():
@@ -139,6 +145,12 @@ def main():
         default=None,
         help="最多处理多少条（用于快速测试）",
     )
+    parser.add_argument(
+        "--id_column",
+        type=str,
+        default="study_id",
+        help="CSV 中用作 id 的列名（如 study_id），输出 JSON 每条会带 id 字段",
+    )
     args = parser.parse_args()
 
     df = pd.read_csv(
@@ -174,6 +186,7 @@ def main():
                 image_base_path=args.image_base_path,
                 prompt=args.prompt,
                 use_relative_path=args.use_relative_path,
+                id_column=args.id_column,
             )
             if item is not None:
                 result.append(item)
